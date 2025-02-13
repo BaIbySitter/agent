@@ -1,12 +1,13 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { initializeAgentExecutorWithOptions } from "langchain/agents";
 import { getTools } from './tools.js';
-import Safe, { EthersAdapter, SafeFactory } from '@safe-global/protocol-kit';
+import Safe, { EthersAdapter } from '@safe-global/protocol-kit';
 import { ethers } from 'ethers';
 import { getAllowanceModuleDeployment } from '@safe-global/safe-modules-deployments';
 import { createPublicClient, http, encodeFunctionData, zeroAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { getSafeSingletonDeployment } from '@safe-global/safe-deployments';
+import SafeApiKit from '@safe-global/api-kit';
 
 interface TransactionRequest {
   status: 'blocked' | 'approved' | 'warning';
@@ -26,19 +27,24 @@ export class AnalysisAgent {
   private model: any;
   private agent: any;
   private safe: any;
-  private publicClient: any;
-  private allowanceModule: any;
-  private aiAnalysis: string = ""; // Store AI analysis result
+  private safeApiKit: any;
+  private aiAnalysis: string = "";
 
   constructor(
     private readonly apiKey: string,
     private readonly agentPrivateKey: string,
-    private readonly rpcUrl: string, // RPC URL from .env
+    private readonly rpcUrl: string,
   ) {
     this.model = new ChatOpenAI({
       modelName: "gpt-3.5-turbo",
       temperature: 0,
       openAIApiKey: apiKey,
+    });
+
+    // Initialize SafeApiKit
+    this.safeApiKit = new SafeApiKit.default({
+    //   txServiceUrl: 'https://safe-transaction.arbitrum.gnosis.io',
+      chainId: 42161n // Arbitrum
     });
   }
 
@@ -51,8 +57,11 @@ export class AnalysisAgent {
       signerOrProvider: signer
     });
 
-    this.publicClient = createPublicClient({ transport: http(this.rpcUrl) });
-    this.safe = await Safe.default.create({ ethAdapter, safeAddress: safeAddress });
+    // Initialize Safe instance
+    this.safe = await Safe.default.create({
+      ethAdapter,
+      safeAddress
+    });
 
     const tools = getTools();
     this.agent = await initializeAgentExecutorWithOptions(
@@ -62,6 +71,62 @@ export class AnalysisAgent {
     );
   }
 
+  async getPendingTransactions(safeAddress: string) {
+    try {
+      console.log('Fetching pending transactions for Safe:', safeAddress);
+      
+      const pendingTxs = await this.safeApiKit.getPendingTransactions(safeAddress);
+      console.log('API Response:', pendingTxs);
+      
+      return pendingTxs.results;
+    } catch (error: any) {
+      if (error.message === 'Not Found') {
+        console.log(`No pending transactions found for Safe: ${safeAddress}`);
+        return [];
+      }
+      console.error('Full error:', error);
+      throw error;
+    }
+  }
+
+  async signAndExecuteTransaction(txRequest: TransactionRequest, pendingTx: any) {
+    try {
+      console.log('Signing transaction:', pendingTx.safeTxHash);
+      
+      // Sign the transaction hash
+      const signature = await this.safe.signTransactionHash(pendingTx.safeTxHash);
+      console.log('Generated signature:', signature);
+
+      // Format the confirmation properly
+      const signatureResponse = await this.safeApiKit.confirmTransaction(
+        pendingTx.safeTxHash,
+        signature.data  // Just send the signature data directly
+      );
+      console.log('Confirmation response:', signatureResponse);
+
+      // Check if we can execute
+      const threshold = await this.safe.getThreshold();
+      const signatures = await this.safeApiKit.getTransactionConfirmations(pendingTx.safeTxHash);
+
+      console.log('Threshold:', threshold);
+      console.log('Current signatures:', signatures.count);
+
+      if (signatures.count >= threshold) {
+        // Execute the transaction
+        const executeTxResponse = await this.safe.executeTransaction(pendingTx);
+        const receipt = await executeTxResponse.transactionResponse?.wait();
+        
+        console.log('Transaction executed:', receipt);
+        return { signature: signature.data, receipt };
+      }
+
+      return { signature: signature.data, receipt: null };
+    } catch (error) {
+      console.error('Detailed error:', error);
+      throw error;
+    }
+  }
+
   async signExistingTransaction(txRequest: TransactionRequest): Promise<SignResponse> {
     let signature: string | null = null;
     let agent_reason: string = "";
@@ -69,40 +134,39 @@ export class AnalysisAgent {
     try {
       await this.initialize(txRequest.safeAddress);
 
-      // If status is blocked, reject immediately
-      if (txRequest.status === 'blocked') {
-        agent_reason = `Transaction rejected: ${txRequest.bot_reason}`;
+      // Get pending transactions
+      const pendingTxs = await this.getPendingTransactions(txRequest.safeAddress);
+      
+      if (pendingTxs.length === 0) {
+        agent_reason = "No pending transactions found for this Safe";
         return { signature: null, agent_reason };
       }
 
-      // If status is approved, sign immediately
-      if (txRequest.status === 'approved') {
-        const messageHash = ethers.utils.keccak256(
-          ethers.utils.defaultAbiCoder.encode(
-            ['address', 'uint256'],
-            [txRequest.txpayload.to, txRequest.txpayload.value]
-          )
-        );
+      const pendingTx = pendingTxs[0]; // Get first pending transaction
 
-        const signer = new ethers.Wallet(this.agentPrivateKey);
-        signature = await signer.signMessage(ethers.utils.arrayify(messageHash));
-        agent_reason = `Transaction approved: ${txRequest.bot_reason}`;
+      // Always get AI analysis regardless of status
+      await this.analyzeSafeTransaction(txRequest);
+      // this.aiAnalysis is already set inside analyzeSafeTransaction
+
+      // Process based on status
+      if (txRequest.status === 'blocked') {
+        signature = null;
+        agent_reason = this.aiAnalysis; // Use AI's analysis even though it's blocked
         return { signature, agent_reason };
       }
 
-      // If status is warning, analyze with AI
-      if (txRequest.status === 'warning') {
-        const shouldSign = await this.analyzeSafeTransaction(txRequest);
-        if (shouldSign) {
-          const messageHash = ethers.utils.keccak256(
-            ethers.utils.defaultAbiCoder.encode(
-              ['address', 'uint256'],
-              [txRequest.txpayload.to, txRequest.txpayload.value]
-            )
-          );
+      if (txRequest.status === 'approved') {
+        const { signature: sig, receipt } = await this.signAndExecuteTransaction(txRequest, pendingTx);
+        signature = receipt?.transactionHash || sig;
+        agent_reason = this.aiAnalysis; // Use AI's analysis even though it's approved
+        return { signature, agent_reason };
+      }
 
-          const signer = new ethers.Wallet(this.agentPrivateKey);
-          signature = await signer.signMessage(ethers.utils.arrayify(messageHash));
+      // For warning status, use AI analysis to decide
+      if (txRequest.status === 'warning') {
+        if (this.aiAnalysis) {
+          const { signature: sig, receipt } = await this.signAndExecuteTransaction(txRequest, pendingTx);
+          signature = receipt?.transactionHash || sig;
         }
         agent_reason = this.aiAnalysis;
       }
